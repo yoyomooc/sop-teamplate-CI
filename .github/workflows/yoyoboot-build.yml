@@ -17,7 +17,6 @@ jobs:
   validate-request:
     runs-on: ubuntu-24.04
     outputs:
-      source_repository: ${{ steps.validate.outputs.source_repository }}
       source_ref: ${{ steps.validate.outputs.source_ref }}
       source_sha: ${{ steps.validate.outputs.source_sha }}
 
@@ -88,7 +87,6 @@ jobs:
           PY
 
           {
-            echo "source_repository=$SOURCE_REPOSITORY"
             echo "source_ref=$SOURCE_REF"
             echo "source_sha=$SOURCE_SHA"
           } >> "$GITHUB_OUTPUT"
@@ -97,7 +95,7 @@ jobs:
     needs: validate-request
     runs-on: ubuntu-24.04
     env:
-      SOURCE_REPOSITORY: ${{ needs.validate-request.outputs.source_repository }}
+      SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
       SOURCE_REF: ${{ needs.validate-request.outputs.source_ref }}
       SOURCE_SHA: ${{ needs.validate-request.outputs.source_sha }}
 
