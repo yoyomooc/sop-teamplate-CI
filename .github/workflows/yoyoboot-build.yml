@@ -5,8 +5,8 @@ on:
     types:
       - yoyoboot-build-request
 
-# The public repository never needs a writable GITHUB_TOKEN. Private-source
-# access uses a repository-scoped, read-only Fine-grained PAT secret.
+# The public repository never needs a writable GITHUB_TOKEN.  Private-source
+# access is obtained only from the short-lived GitHub App token below.
 permissions: {}
 
 concurrency:
@@ -26,7 +26,7 @@ jobs:
         id: validate
         shell: bash
         env:
-          EXPECTED_SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
+          EXPECTED_SOURCE_REPOSITORY: ${{ vars.PRIVATE_SOURCE_REPOSITORY }}
           DISPATCH_HMAC_SECRET: ${{ secrets.PRIVATE_BUILD_DISPATCH_HMAC_SECRET }}
           PROTOCOL: ${{ github.event.client_payload.protocol }}
           SOURCE_REPOSITORY: ${{ github.event.client_payload.source_repository }}
@@ -102,35 +102,33 @@ jobs:
       SOURCE_SHA: ${{ needs.validate-request.outputs.source_sha }}
 
     steps:
+      - name: Create read-only private-source token
+        id: source-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.PRIVATE_SOURCE_GITHUB_APP_ID }}
+          private-key: ${{ secrets.PRIVATE_SOURCE_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ vars.PRIVATE_SOURCE_GITHUB_APP_OWNER }}
+
       - name: Check out requested private source revision
         uses: actions/checkout@v6
         with:
           repository: ${{ env.SOURCE_REPOSITORY }}
           ref: ${{ env.SOURCE_SHA }}
-          token: ${{ secrets.PRIVATE_SOURCE_PAT }}
+          token: ${{ steps.source-token.outputs.token }}
           path: source
           fetch-depth: 1
           persist-credentials: false
 
       - name: Verify source branch still points to requested commit
         shell: bash
-        env:
-          SOURCE_READ_TOKEN: ${{ secrets.PRIVATE_SOURCE_PAT }}
         run: |
           set -euo pipefail
-          [[ -n "$SOURCE_READ_TOKEN" ]] || {
-            echo 'Secret PRIVATE_SOURCE_PAT is required.' >&2
-            exit 1
-          }
           [[ "$(git -C source rev-parse HEAD)" == "$SOURCE_SHA" ]] || {
             echo 'Checked-out commit differs from the signed dispatch SHA.' >&2
             exit 1
           }
-          remote_sha="$(curl --fail-with-body --silent --show-error \
-            --header 'Accept: application/vnd.github+json' \
-            --header "Authorization: Bearer ${SOURCE_READ_TOKEN}" \
-            --header 'X-GitHub-Api-Version: 2022-11-28' \
-            "${GITHUB_API_URL}/repos/${SOURCE_REPOSITORY}/commits/${SOURCE_REF}" | jq -r '.sha')"
+          remote_sha="$(git -C source ls-remote origin "$SOURCE_REF" | awk 'NR == 1 { print $1 }')"
           [[ "$remote_sha" == "$SOURCE_SHA" ]] || {
             echo "Source ref $SOURCE_REF no longer points to $SOURCE_SHA." >&2
             exit 1
