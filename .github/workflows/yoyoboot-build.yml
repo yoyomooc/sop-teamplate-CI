@@ -26,7 +26,7 @@ jobs:
         id: validate
         shell: bash
         env:
-          EXPECTED_SOURCE_REPOSITORY: ${{ vars.PRIVATE_SOURCE_REPOSITORY }}
+          EXPECTED_SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
           DISPATCH_HMAC_SECRET: ${{ secrets.PRIVATE_BUILD_DISPATCH_HMAC_SECRET }}
           PROTOCOL: ${{ github.event.client_payload.protocol }}
           SOURCE_REPOSITORY: ${{ github.event.client_payload.source_repository }}
