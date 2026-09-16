@@ -95,6 +95,9 @@ jobs:
     needs: validate-request
     runs-on: ubuntu-24.04
     env:
+      # GitHub suppresses job outputs that equal a secret. The validated
+      # repository name is therefore read directly here rather than passed
+      # through validate-request's outputs.
       SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
       SOURCE_REF: ${{ needs.validate-request.outputs.source_ref }}
       SOURCE_SHA: ${{ needs.validate-request.outputs.source_sha }}
@@ -154,7 +157,7 @@ jobs:
       - name: Set up .NET
         uses: actions/setup-dotnet@v5
         with:
-          dotnet-version: 9.0.x
+          global-json-file: source/global.json
 
       - name: Build, test and package private source
         shell: pwsh
