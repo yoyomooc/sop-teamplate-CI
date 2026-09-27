@@ -1,9 +1,15 @@
-name: "buildx"
+name: "Legacy Template Images"
 
 on:
   push:
     paths:
-      - "**/**"
+      - ".github/workflows/build.yml"
+      - "build/**"
+      - "src/fengshenauth/**"
+      - "src/uni-app/**"
+      - "src/vue/**"
+      - "src/hostapi/**"
+      - "src/migrator/**"
 
 env:
   repository: ${{ github.repository }}
