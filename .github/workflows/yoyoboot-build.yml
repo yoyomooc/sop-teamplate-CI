@@ -32,7 +32,6 @@ jobs:
           SOURCE_SHA: ${{ github.event.client_payload.source_sha }}
           SOURCE_BEFORE_SHA: ${{ github.event.client_payload.source_before_sha }}
           SOURCE_RUN_ID: ${{ github.event.client_payload.source_run_id }}
-          SOURCE_RUN_ATTEMPT: ${{ github.event.client_payload.source_run_attempt }}
           BUILD_INTENT: ${{ github.event.client_payload.build_intent }}
           ISSUED_AT: ${{ github.event.client_payload.issued_at }}
           NONCE: ${{ github.event.client_payload.nonce }}
@@ -42,7 +41,7 @@ jobs:
           [[ -n "$EXPECTED_SOURCE_REPOSITORY" ]] || { echo 'Secret PRIVATE_SOURCE_REPOSITORY is required.' >&2; exit 1; }
           [[ -n "$DISPATCH_HMAC_SECRET" ]] || { echo 'Secret PRIVATE_BUILD_DISPATCH_HMAC_SECRET is required.' >&2; exit 1; }
 
-          export EXPECTED_SOURCE_REPOSITORY DISPATCH_HMAC_SECRET PROTOCOL SOURCE_REPOSITORY SOURCE_REF SOURCE_SHA SOURCE_BEFORE_SHA SOURCE_RUN_ID SOURCE_RUN_ATTEMPT BUILD_INTENT ISSUED_AT NONCE SIGNATURE
+          export EXPECTED_SOURCE_REPOSITORY DISPATCH_HMAC_SECRET PROTOCOL SOURCE_REPOSITORY SOURCE_REF SOURCE_SHA SOURCE_BEFORE_SHA SOURCE_RUN_ID BUILD_INTENT ISSUED_AT NONCE SIGNATURE
           python3 - <<'PY'
           import base64
           import hashlib
@@ -54,7 +53,7 @@ jobs:
 
           values = {name: os.environ[name] for name in (
               'PROTOCOL', 'SOURCE_REPOSITORY', 'SOURCE_REF', 'SOURCE_SHA', 'SOURCE_BEFORE_SHA',
-              'SOURCE_RUN_ID', 'SOURCE_RUN_ATTEMPT', 'BUILD_INTENT',
+              'SOURCE_RUN_ID', 'BUILD_INTENT',
               'ISSUED_AT', 'NONCE', 'SIGNATURE')}
           if values['PROTOCOL'] != 'yoyoboot-public-build/v3':
               sys.exit('Unsupported dispatch protocol.')
@@ -70,8 +69,6 @@ jobs:
               sys.exit('Invalid source before SHA.')
           if not re.fullmatch(r'[1-9][0-9]*', values['SOURCE_RUN_ID']):
               sys.exit('Invalid source run id.')
-          if not re.fullmatch(r'[1-9][0-9]*', values['SOURCE_RUN_ATTEMPT']):
-              sys.exit('Invalid source run attempt.')
           if values['BUILD_INTENT'] not in ('ci', 'image'):
               sys.exit('Unsupported build intent.')
           branch = values['SOURCE_REF'].removeprefix('refs/heads/')
@@ -91,7 +88,7 @@ jobs:
 
           material = ''.join(f"{values[key]}\n" for key in (
               'PROTOCOL', 'SOURCE_REPOSITORY', 'SOURCE_REF', 'SOURCE_SHA', 'SOURCE_BEFORE_SHA',
-              'SOURCE_RUN_ID', 'SOURCE_RUN_ATTEMPT', 'BUILD_INTENT', 'ISSUED_AT', 'NONCE'))
+              'SOURCE_RUN_ID', 'BUILD_INTENT', 'ISSUED_AT', 'NONCE'))
           expected = base64.b64encode(hmac.new(
               os.environ['DISPATCH_HMAC_SECRET'].encode(), material.encode(), hashlib.sha256).digest()).decode()
           if not hmac.compare_digest(expected, values['SIGNATURE']):
