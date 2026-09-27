@@ -5,8 +5,6 @@ on:
     types:
       - yoyoboot-build-request
 
-# The public repository never needs a writable GITHUB_TOKEN. Private-source
-# access uses a repository-scoped, read-only Fine-grained PAT secret.
 permissions: {}
 
 concurrency:
@@ -19,7 +17,7 @@ jobs:
     outputs:
       source_ref: ${{ steps.validate.outputs.source_ref }}
       source_sha: ${{ steps.validate.outputs.source_sha }}
-
+      build_intent: ${{ steps.validate.outputs.build_intent }}
     steps:
       - name: Validate signed request
         id: validate
@@ -33,15 +31,16 @@ jobs:
           SOURCE_SHA: ${{ github.event.client_payload.source_sha }}
           SOURCE_RUN_ID: ${{ github.event.client_payload.source_run_id }}
           SOURCE_RUN_ATTEMPT: ${{ github.event.client_payload.source_run_attempt }}
+          BUILD_INTENT: ${{ github.event.client_payload.build_intent }}
           ISSUED_AT: ${{ github.event.client_payload.issued_at }}
           NONCE: ${{ github.event.client_payload.nonce }}
           SIGNATURE: ${{ github.event.client_payload.signature }}
         run: |
           set -euo pipefail
-          [[ -n "$EXPECTED_SOURCE_REPOSITORY" ]] || { echo 'Variable PRIVATE_SOURCE_REPOSITORY is required.' >&2; exit 1; }
+          [[ -n "$EXPECTED_SOURCE_REPOSITORY" ]] || { echo 'Secret PRIVATE_SOURCE_REPOSITORY is required.' >&2; exit 1; }
           [[ -n "$DISPATCH_HMAC_SECRET" ]] || { echo 'Secret PRIVATE_BUILD_DISPATCH_HMAC_SECRET is required.' >&2; exit 1; }
 
-          export EXPECTED_SOURCE_REPOSITORY DISPATCH_HMAC_SECRET PROTOCOL SOURCE_REPOSITORY SOURCE_REF SOURCE_SHA SOURCE_RUN_ID SOURCE_RUN_ATTEMPT ISSUED_AT NONCE SIGNATURE
+          export EXPECTED_SOURCE_REPOSITORY DISPATCH_HMAC_SECRET PROTOCOL SOURCE_REPOSITORY SOURCE_REF SOURCE_SHA SOURCE_RUN_ID SOURCE_RUN_ATTEMPT BUILD_INTENT ISSUED_AT NONCE SIGNATURE
           python3 - <<'PY'
           import base64
           import hashlib
@@ -53,8 +52,9 @@ jobs:
 
           values = {name: os.environ[name] for name in (
               'PROTOCOL', 'SOURCE_REPOSITORY', 'SOURCE_REF', 'SOURCE_SHA',
-              'SOURCE_RUN_ID', 'SOURCE_RUN_ATTEMPT', 'ISSUED_AT', 'NONCE', 'SIGNATURE')}
-          if values['PROTOCOL'] != 'yoyoboot-public-build/v1':
+              'SOURCE_RUN_ID', 'SOURCE_RUN_ATTEMPT', 'BUILD_INTENT',
+              'ISSUED_AT', 'NONCE', 'SIGNATURE')}
+          if values['PROTOCOL'] != 'yoyoboot-public-build/v2':
               sys.exit('Unsupported dispatch protocol.')
           if values['SOURCE_REPOSITORY'] != os.environ['EXPECTED_SOURCE_REPOSITORY']:
               sys.exit('Dispatch source repository is not the configured private source.')
@@ -68,6 +68,14 @@ jobs:
               sys.exit('Invalid source run id.')
           if not re.fullmatch(r'[1-9][0-9]*', values['SOURCE_RUN_ATTEMPT']):
               sys.exit('Invalid source run attempt.')
+          if values['BUILD_INTENT'] not in ('ci', 'image'):
+              sys.exit('Unsupported build intent.')
+          branch = values['SOURCE_REF'].removeprefix('refs/heads/')
+          expected_intent = 'image' if branch == 'main' else 'ci' if (
+              branch.startswith('dev-') or branch.startswith('codex/') or branch.startswith('code/')
+          ) else None
+          if expected_intent is None or values['BUILD_INTENT'] != expected_intent:
+              sys.exit('Build intent does not match the configured source branch policy.')
           if not re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', values['NONCE']):
               sys.exit('Invalid dispatch nonce.')
           try:
@@ -79,7 +87,7 @@ jobs:
 
           material = ''.join(f"{values[key]}\n" for key in (
               'PROTOCOL', 'SOURCE_REPOSITORY', 'SOURCE_REF', 'SOURCE_SHA',
-              'SOURCE_RUN_ID', 'SOURCE_RUN_ATTEMPT', 'ISSUED_AT', 'NONCE'))
+              'SOURCE_RUN_ID', 'SOURCE_RUN_ATTEMPT', 'BUILD_INTENT', 'ISSUED_AT', 'NONCE'))
           expected = base64.b64encode(hmac.new(
               os.environ['DISPATCH_HMAC_SECRET'].encode(), material.encode(), hashlib.sha256).digest()).decode()
           if not hmac.compare_digest(expected, values['SIGNATURE']):
@@ -89,19 +97,30 @@ jobs:
           {
             echo "source_ref=$SOURCE_REF"
             echo "source_sha=$SOURCE_SHA"
+            echo "build_intent=$BUILD_INTENT"
           } >> "$GITHUB_OUTPUT"
 
-  frontend-verify:
+  quality-gate:
     needs: validate-request
     runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     env:
-      # GitHub suppresses job outputs that equal a secret. The validated
-      # repository name is therefore read directly here rather than passed
-      # through validate-request's outputs.
       SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
       SOURCE_REF: ${{ needs.validate-request.outputs.source_ref }}
       SOURCE_SHA: ${{ needs.validate-request.outputs.source_sha }}
-
     steps:
       - name: Check out requested private source revision
         uses: actions/checkout@v6
@@ -112,62 +131,51 @@ jobs:
           path: source
           fetch-depth: 1
           persist-credentials: false
-
       - name: Verify source branch still points to requested commit
         shell: bash
         env:
           SOURCE_READ_TOKEN: ${{ secrets.PRIVATE_SOURCE_PAT }}
         run: |
           set -euo pipefail
-          [[ -n "$SOURCE_READ_TOKEN" ]] || {
-            echo 'Secret PRIVATE_SOURCE_PAT is required.' >&2
-            exit 1
-          }
-          [[ "$(git -C source rev-parse HEAD)" == "$SOURCE_SHA" ]] || {
-            echo 'Checked-out commit differs from the signed dispatch SHA.' >&2
-            exit 1
-          }
+          [[ "$(git -C source rev-parse HEAD)" == "$SOURCE_SHA" ]]
           remote_sha="$(curl --fail-with-body --silent --show-error \
             --header 'Accept: application/vnd.github+json' \
             --header "Authorization: Bearer ${SOURCE_READ_TOKEN}" \
             --header 'X-GitHub-Api-Version: 2022-11-28' \
             "${GITHUB_API_URL}/repos/${SOURCE_REPOSITORY}/commits/${SOURCE_REF}" | jq -r '.sha')"
-          [[ "$remote_sha" == "$SOURCE_SHA" ]] || {
-            echo "Source ref $SOURCE_REF no longer points to $SOURCE_SHA." >&2
-            exit 1
-          }
-
-      - name: Set up pnpm
-        uses: pnpm/action-setup@v6
+          [[ "$remote_sha" == "$SOURCE_SHA" ]] || { echo 'Source ref moved after dispatch.' >&2; exit 1; }
+      - uses: actions/setup-node@v6
         with:
-          version: 10.33.0
-          cache: true
-          cache_dependency_path: |
-            source/packages/basic-module-vue/pnpm-lock.yaml
-            source/apps/yoyo-admin/admin-vue/pnpm-lock.yaml
-            source/packages/yoyo-admin/pnpm-lock.yaml
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: 22
+          node-version: 24.20.0
           package-manager-cache: false
-
-      - name: Compile frontend source
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+      - name: Run repository-owned build and test quality gate
         shell: pwsh
         working-directory: source
-        run: ./scripts/public-build-runner/Invoke-YoyoBootPublicBuild.ps1 -Stage Frontend
+        run: >-
+          ./scripts/public-build-runner/Invoke-YoyoBootPublicQualityGate.ps1
+          -OutputDirectory "$env:RUNNER_TEMP/yoyoboot-quality-gate"
+      - name: Upload quality evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: yoyoboot-quality-${{ env.SOURCE_SHA }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/yoyoboot-quality-gate
+          if-no-files-found: warn
 
-  backend-build-pack:
-    needs:
-      - validate-request
-      - frontend-verify
+  image-build-primary:
+    needs: [validate-request, quality-gate]
+    if: ${{ needs.validate-request.outputs.build_intent == 'image' && needs.quality-gate.result == 'success' }}
     runs-on: ubuntu-24.04
+    environment: oci-image-publisher
     env:
       SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
       SOURCE_REF: ${{ needs.validate-request.outputs.source_ref }}
       SOURCE_SHA: ${{ needs.validate-request.outputs.source_sha }}
-
+      PRIMARY_REGISTRY: docker.io
+      PRIMARY_REPOSITORY_PREFIX: ${{ vars.DOCKERHUB_USERNAME }}
     steps:
       - name: Check out requested private source revision
         uses: actions/checkout@v6
@@ -178,31 +186,152 @@ jobs:
           path: source
           fetch-depth: 1
           persist-credentials: false
-
-      - name: Set up .NET
-        uses: actions/setup-dotnet@v5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.20.0
+          package-manager-cache: false
+      - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.0.x
-
-      - name: Build and package backend source
+      - name: Validate Docker Hub primary configuration
+        shell: bash
+        env:
+          PRIMARY_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          PRIMARY_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ -n "$PRIMARY_REPOSITORY_PREFIX" && -n "$PRIMARY_USERNAME" && -n "$PRIMARY_PASSWORD" ]] || {
+            echo 'Docker Hub primary registry configuration is required for image intent.' >&2
+            exit 1
+          }
+      - name: Sign in to Docker Hub primary
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.PRIMARY_REGISTRY }}
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build and publish exact-SHA application images to primary
         shell: pwsh
         working-directory: source
-        run: ./scripts/public-build-runner/Invoke-YoyoBootPublicBuild.ps1 -Stage Backend -OutputDirectory "$env:RUNNER_TEMP/yoyoboot-public-build"
-
-      - name: Upload build artifacts
+        run: >-
+          ./scripts/public-build-runner/Invoke-YoyoBootPublicBuild.ps1
+          -Intent image
+          -OutputDirectory "$env:RUNNER_TEMP/yoyoboot-public-build"
+          -ImageRegistry "$env:PRIMARY_REGISTRY"
+          -ImageRepositoryPrefix "$env:PRIMARY_REPOSITORY_PREFIX"
+          -PushImages
+      - name: Upload primary image manifest and build evidence
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: yoyoboot-${{ env.SOURCE_SHA }}
+          name: yoyoboot-images-${{ env.SOURCE_SHA }}-${{ github.run_id }}
           path: ${{ runner.temp }}/yoyoboot-public-build
-          if-no-files-found: error
+          if-no-files-found: warn
 
-      - name: Write build summary
+  image-mirror-aliyun:
+    needs: [validate-request, quality-gate, image-build-primary]
+    if: ${{ needs.validate-request.outputs.build_intent == 'image' && needs.image-build-primary.result == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - name: aliyun-chengdu
+            registry: ${{ vars.ALIYUN_DOCKERHUB }}
+          - name: aliyun-hong-kong
+            registry: ${{ vars.ALIYUN_HK_DOCKERHUB }}
+    runs-on: ubuntu-24.04
+    environment: oci-image-publisher
+    env:
+      SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
+      SOURCE_SHA: ${{ needs.validate-request.outputs.source_sha }}
+      TARGET_NAME: ${{ matrix.target.name }}
+      TARGET_REGISTRY: ${{ matrix.target.registry }}
+      TARGET_REPOSITORY_PREFIX: yoyosoft
+    steps:
+      - name: Check out mirror publication owner
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ env.SOURCE_SHA }}
+          token: ${{ secrets.PRIVATE_SOURCE_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Download primary image evidence
+        uses: actions/download-artifact@v5
+        with:
+          name: yoyoboot-images-${{ env.SOURCE_SHA }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/yoyoboot-primary-images
+      - name: Validate Aliyun mirror configuration
         shell: bash
+        env:
+          TARGET_USERNAME: ${{ vars.ALIYUN_USERNAME }}
+          TARGET_PASSWORD: ${{ secrets.ALIYUN_PASSWORD }}
         run: |
-          {
-            echo '## Private source build completed'
-            echo
-            echo "- source: \`${SOURCE_REPOSITORY}@${SOURCE_SHA}\`"
-            echo "- ref: \`${SOURCE_REF}\`"
-            echo "- artifact: \`yoyoboot-${SOURCE_SHA}\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          [[ -n "$TARGET_REGISTRY" && -n "$TARGET_USERNAME" && -n "$TARGET_PASSWORD" ]] || {
+            echo "Aliyun mirror configuration is required for ${TARGET_NAME}." >&2
+            exit 1
+          }
+      - name: Sign in to Aliyun mirror
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.TARGET_REGISTRY }}
+          username: ${{ vars.ALIYUN_USERNAME }}
+          password: ${{ secrets.ALIYUN_PASSWORD }}
+      - name: Mirror exact-SHA images and verify digest identity
+        shell: pwsh
+        working-directory: source
+        run: >-
+          ./apps/yoyo-admin/packaging/Publish-YoyoAdminImageMirror.ps1
+          -PrimaryManifestPath "$env:RUNNER_TEMP/yoyoboot-primary-images/images/image-manifest.json"
+          -TargetRegistry "$env:TARGET_REGISTRY"
+          -TargetRepositoryPrefix "$env:TARGET_REPOSITORY_PREFIX"
+          -TargetName "$env:TARGET_NAME"
+          -OutputDirectory "$env:RUNNER_TEMP/yoyoboot-image-mirror-$env:TARGET_NAME"
+      - name: Upload mirror evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: yoyoboot-images-${{ env.TARGET_NAME }}-${{ env.SOURCE_SHA }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/yoyoboot-image-mirror-${{ env.TARGET_NAME }}
+          if-no-files-found: warn
+
+  notify:
+    needs: [validate-request, quality-gate, image-build-primary, image-mirror-aliyun]
+    if: ${{ always() && needs.validate-request.result == 'success' }}
+    continue-on-error: true
+    runs-on: ubuntu-24.04
+    env:
+      SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
+      SOURCE_REF: ${{ needs.validate-request.outputs.source_ref }}
+      SOURCE_SHA: ${{ needs.validate-request.outputs.source_sha }}
+      BUILD_INTENT: ${{ needs.validate-request.outputs.build_intent }}
+      BUILD_NOTIFY_PROVIDER: ${{ vars.BUILD_NOTIFY_PROVIDER }}
+      BUILD_NOTIFY_WEBHOOK: ${{ secrets.BUILD_NOTIFY_WEBHOOK }}
+    steps:
+      - name: Check out notification owner
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ env.SOURCE_SHA }}
+          token: ${{ secrets.PRIVATE_SOURCE_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Notify DingTalk or Feishu
+        continue-on-error: true
+        shell: pwsh
+        working-directory: source
+        run: >-
+          ./scripts/public-build-runner/Send-YoyoBootBuildNotification.ps1
+          -Provider "$env:BUILD_NOTIFY_PROVIDER"
+          -WebhookUrl "$env:BUILD_NOTIFY_WEBHOOK"
+          -SourceRepository "$env:SOURCE_REPOSITORY"
+          -SourceRef "$env:SOURCE_REF"
+          -SourceSha "$env:SOURCE_SHA"
+          -BuildIntent "$env:BUILD_INTENT"
+          -QualityResult '${{ needs.quality-gate.result }}'
+          -ImageResult '${{ needs.image-build-primary.result }}'
+          -MirrorResult '${{ needs.image-mirror-aliyun.result }}'
+          -WorkflowUrl '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
