@@ -103,20 +103,6 @@ jobs:
   quality-gate:
     needs: validate-request
     runs-on: ubuntu-24.04
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_DB: postgres
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d postgres"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
     env:
       SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
       SOURCE_REF: ${{ needs.validate-request.outputs.source_ref }}
@@ -155,7 +141,7 @@ jobs:
         shell: pwsh
         working-directory: source
         run: >-
-          ./scripts/public-build-runner/Invoke-YoyoBootPublicQualityGate.ps1
+          ./scripts/public-build-runner/quality/Invoke-YoyoBootPublicQualityGate.ps1
           -OutputDirectory "$env:RUNNER_TEMP/yoyoboot-quality-gate"
       - name: Upload quality evidence
         if: ${{ always() }}
@@ -214,8 +200,7 @@ jobs:
         shell: pwsh
         working-directory: source
         run: >-
-          ./scripts/public-build-runner/Invoke-YoyoBootPublicBuild.ps1
-          -Intent image
+          ./scripts/public-build-runner/images/Invoke-YoyoBootPublicImageBuild.ps1
           -OutputDirectory "$env:RUNNER_TEMP/yoyoboot-public-build"
           -ImageRegistry "$env:PRIMARY_REGISTRY"
           -ImageRepositoryPrefix "$env:PRIMARY_REPOSITORY_PREFIX"
@@ -309,6 +294,7 @@ jobs:
       BUILD_INTENT: ${{ needs.validate-request.outputs.build_intent }}
       BUILD_NOTIFY_PROVIDER: ${{ vars.BUILD_NOTIFY_PROVIDER }}
       BUILD_NOTIFY_WEBHOOK: ${{ secrets.BUILD_NOTIFY_WEBHOOK }}
+      BUILD_NOTIFY_SECRET: ${{ secrets.BUILD_NOTIFY_SECRET }}
     steps:
       - name: Check out notification owner
         uses: actions/checkout@v6
@@ -324,9 +310,10 @@ jobs:
         shell: pwsh
         working-directory: source
         run: >-
-          ./scripts/public-build-runner/Send-YoyoBootBuildNotification.ps1
+          ./scripts/public-build-runner/notifications/Send-YoyoBootBuildNotification.ps1
           -Provider "$env:BUILD_NOTIFY_PROVIDER"
           -WebhookUrl "$env:BUILD_NOTIFY_WEBHOOK"
+          -WebhookSecret "$env:BUILD_NOTIFY_SECRET"
           -SourceRepository "$env:SOURCE_REPOSITORY"
           -SourceRef "$env:SOURCE_REF"
           -SourceSha "$env:SOURCE_SHA"
