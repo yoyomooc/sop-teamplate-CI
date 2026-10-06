@@ -1,0 +1,100 @@
+name: YoyoBoot build notification
+
+on:
+  workflow_call:
+    inputs:
+      source-ref:
+        type: string
+        required: true
+      source-sha:
+        type: string
+        required: true
+      build-intent:
+        type: string
+        required: true
+      results-json:
+        type: string
+        required: true
+    secrets:
+      PRIVATE_SOURCE_REPOSITORY:
+        required: true
+      PRIVATE_SOURCE_PAT:
+        required: true
+      BUILD_NOTIFY_WEBHOOK:
+        required: false
+      BUILD_NOTIFY_SECRET:
+        required: false
+
+permissions: {}
+
+jobs:
+  notify:
+    continue-on-error: true
+    runs-on: ubuntu-24.04
+    env:
+      SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
+      SOURCE_REF: ${{ inputs.source-ref }}
+      SOURCE_SHA: ${{ inputs.source-sha }}
+      BUILD_INTENT: ${{ inputs.build-intent }}
+      RESULTS_JSON: ${{ inputs.results-json }}
+      BUILD_NOTIFY_PROVIDER: ${{ vars.BUILD_NOTIFY_PROVIDER }}
+      BUILD_NOTIFY_WEBHOOK: ${{ secrets.BUILD_NOTIFY_WEBHOOK }}
+      BUILD_NOTIFY_SECRET: ${{ secrets.BUILD_NOTIFY_SECRET }}
+    steps:
+      - name: Check out notification owner
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ env.SOURCE_SHA }}
+          token: ${{ secrets.PRIVATE_SOURCE_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Download Admin notification evidence
+        if: ${{ fromJSON(inputs.results-json)['admin-delivery'].outputs['has-primary'] == 'true' }}
+        uses: actions/download-artifact@v5
+        with:
+          name: yoyoboot-image-summary-${{ env.SOURCE_SHA }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/yoyoboot-notification-primary/admin
+      - name: Download Docs notification evidence
+        if: ${{ fromJSON(inputs.results-json)['docs-delivery'].outputs['build-result'] == 'success' }}
+        uses: actions/download-artifact@v5
+        with:
+          name: yoyoboot-image-yoyoboot-docs-${{ env.SOURCE_SHA }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/yoyoboot-notification-primary/docs
+      - name: Notify DingTalk or Feishu
+        continue-on-error: true
+        shell: pwsh
+        working-directory: source
+        run: |
+          $results = $env:RESULTS_JSON | ConvertFrom-Json -AsHashtable
+          function Get-DeliveryResult([string] $job, [string] $output = '') {
+            $result = $results[$job] ?? @{}
+            $outputs = $result['outputs'] ?? @{}
+            if ($output -and $outputs[$output]) {
+              return [string] $outputs[$output]
+            }
+            return [string] ($result['result'] ?? 'skipped')
+          }
+          $scope = $results['image-scope'].outputs ?? @{}
+          $admin = $results['admin-delivery'].outputs ?? @{}
+          ./scripts/public-build-runner/notifications/Send-YoyoBootBuildNotification.ps1 `
+            -Provider "$env:BUILD_NOTIFY_PROVIDER" `
+            -WebhookUrl "$env:BUILD_NOTIFY_WEBHOOK" `
+            -WebhookSecret "$env:BUILD_NOTIFY_SECRET" `
+            -SourceRepository "$env:SOURCE_REPOSITORY" `
+            -SourceRef "$env:SOURCE_REF" `
+            -SourceSha "$env:SOURCE_SHA" `
+            -BuildIntent "$env:BUILD_INTENT" `
+            -QualityResult (Get-DeliveryResult 'quality-gate') `
+            -ImageResult (Get-DeliveryResult 'admin-delivery' 'result') `
+            -ImageComponentsJson ([string] ($scope.components_json ?? '[]')) `
+            -ScopeResult (Get-DeliveryResult 'image-scope') `
+            -DocsResult (Get-DeliveryResult 'docs-delivery' 'build-result') `
+            -DocsValidationResult (Get-DeliveryResult 'docs-delivery' 'validation-result') `
+            -DocsMirrorResult (Get-DeliveryResult 'docs-delivery' 'mirror-result') `
+            -DocsSelected:($scope.has_docs -eq 'true') `
+            -PrimaryManifestsDirectory "$env:RUNNER_TEMP/yoyoboot-notification-primary" `
+            -ComponentResultsJson ([string] ($admin['component-results-json'] ?? '{}')) `
+            -MirrorResult (Get-DeliveryResult 'admin-delivery' 'mirror-result') `
+            -WorkflowUrl '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'

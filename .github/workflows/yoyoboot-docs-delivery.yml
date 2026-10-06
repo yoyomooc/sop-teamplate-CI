@@ -1,0 +1,205 @@
+name: YoyoBoot Docs delivery
+
+on:
+  workflow_call:
+    inputs:
+      source-ref:
+        type: string
+        required: true
+      source-sha:
+        type: string
+        required: true
+      build-intent:
+        type: string
+        required: true
+    secrets:
+      PRIVATE_SOURCE_REPOSITORY:
+        required: true
+      PRIVATE_SOURCE_PAT:
+        required: true
+      DOCKERHUB_TOKEN:
+        required: false
+      ALIYUN_PASSWORD:
+        required: false
+    outputs:
+      build-result:
+        value: ${{ jobs.delivery-result.outputs.build-result }}
+      validation-result:
+        value: ${{ jobs.delivery-result.outputs.validation-result }}
+      mirror-result:
+        value: ${{ jobs.delivery-result.outputs.mirror-result }}
+
+permissions: {}
+
+jobs:
+  build-yoyoboot-docs:
+    if: ${{ inputs.build-intent == 'image' }}
+    runs-on: ubuntu-24.04
+    environment: oci-image-publisher
+    env:
+      SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
+      SOURCE_REF: ${{ inputs.source-ref }}
+      SOURCE_SHA: ${{ inputs.source-sha }}
+      COMPONENT_ID: yoyoboot-docs
+      COMPONENTS_JSON: '["yoyoboot-docs"]'
+      PRIMARY_REGISTRY: docker.io
+      PRIMARY_REPOSITORY_PREFIX: ${{ vars.DOCKERHUB_USERNAME }}
+    steps:
+      - name: Check out requested private source revision
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ env.SOURCE_SHA }}
+          token: ${{ secrets.PRIVATE_SOURCE_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.20.0
+          package-manager-cache: false
+      - name: Validate Docker Hub primary configuration
+        shell: bash
+        env:
+          PRIMARY_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          PRIMARY_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ -n "$PRIMARY_REPOSITORY_PREFIX" && -n "$PRIMARY_USERNAME" && -n "$PRIMARY_PASSWORD" ]] || exit 1
+      - name: Sign in to Docker Hub primary
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.PRIMARY_REGISTRY }}
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build and publish yoyoboot-docs exact-SHA image to primary
+        shell: pwsh
+        working-directory: source
+        run: >-
+          ./scripts/public-build-runner/images/Invoke-YoyoBootDocsBuild.ps1
+          -OutputDirectory "$env:RUNNER_TEMP/yoyoboot-public-build-$env:COMPONENT_ID"
+          -ImageRegistry "$env:PRIMARY_REGISTRY"
+          -ImageRepositoryPrefix "$env:PRIMARY_REPOSITORY_PREFIX"
+          -PushImages
+      - name: Upload yoyoboot-docs primary manifest and build evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: yoyoboot-image-yoyoboot-docs-${{ env.SOURCE_SHA }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/yoyoboot-public-build-yoyoboot-docs
+          if-no-files-found: warn
+
+  validate-yoyoboot-docs:
+    if: ${{ inputs.build-intent == 'ci' }}
+    runs-on: ubuntu-24.04
+    env:
+      SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
+      SOURCE_REF: ${{ inputs.source-ref }}
+      SOURCE_SHA: ${{ inputs.source-sha }}
+      COMPONENT_ID: yoyoboot-docs
+      COMPONENTS_JSON: '["yoyoboot-docs"]'
+    steps:
+      - name: Check out requested private source revision
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ env.SOURCE_SHA }}
+          token: ${{ secrets.PRIVATE_SOURCE_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.20.0
+          package-manager-cache: false
+      - name: Validate independent documentation delivery
+        shell: pwsh
+        working-directory: source
+        run: >-
+          ./scripts/public-build-runner/images/Invoke-YoyoBootDocsBuild.ps1
+          -OutputDirectory "$env:RUNNER_TEMP/yoyoboot-docs-validation"
+
+  docs-mirror-aliyun:
+    needs: build-yoyoboot-docs
+    if: ${{ always() && inputs.build-intent == 'image' && needs.build-yoyoboot-docs.result == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - name: aliyun-chengdu
+            registry: ${{ vars.ALIYUN_DOCKERHUB }}
+          - name: aliyun-hong-kong
+            registry: ${{ vars.ALIYUN_HK_DOCKERHUB }}
+    runs-on: ubuntu-24.04
+    environment: oci-image-publisher
+    env:
+      SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
+      SOURCE_SHA: ${{ inputs.source-sha }}
+      TARGET_NAME: ${{ matrix.target.name }}
+      TARGET_REGISTRY: ${{ matrix.target.registry }}
+      TARGET_REPOSITORY_PREFIX: yoyosoft
+    steps:
+      - name: Check out mirror publication owner
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ env.SOURCE_SHA }}
+          token: ${{ secrets.PRIVATE_SOURCE_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Download primary image summary
+        uses: actions/download-artifact@v5
+        with:
+          name: yoyoboot-image-yoyoboot-docs-${{ env.SOURCE_SHA }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/yoyoboot-docs-primary
+      - name: Validate Aliyun mirror configuration
+        shell: bash
+        env:
+          TARGET_USERNAME: ${{ vars.ALIYUN_USERNAME }}
+          TARGET_PASSWORD: ${{ secrets.ALIYUN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          [[ -n "$TARGET_REGISTRY" && -n "$TARGET_USERNAME" && -n "$TARGET_PASSWORD" ]] || {
+            echo "Aliyun mirror configuration is required for ${TARGET_NAME}." >&2
+            exit 1
+          }
+      - name: Sign in to Aliyun mirror
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.TARGET_REGISTRY }}
+          username: ${{ vars.ALIYUN_USERNAME }}
+          password: ${{ secrets.ALIYUN_PASSWORD }}
+      - name: Mirror exact-SHA images and verify digest identity
+        shell: pwsh
+        working-directory: source
+        run: >-
+          ./scripts/public-build-runner/images/Publish-YoyoBootImageMirror.ps1
+          -PrimaryManifestPath "$env:RUNNER_TEMP/yoyoboot-docs-primary/images/image-manifest.json"
+          -TargetRegistry "$env:TARGET_REGISTRY"
+          -TargetRepositoryPrefix "$env:TARGET_REPOSITORY_PREFIX"
+          -TargetName "$env:TARGET_NAME"
+          -OutputDirectory "$env:RUNNER_TEMP/yoyoboot-docs-mirror-$env:TARGET_NAME"
+      - name: Upload mirror evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: yoyoboot-docs-images-${{ env.TARGET_NAME }}-${{ env.SOURCE_SHA }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/yoyoboot-docs-mirror-${{ env.TARGET_NAME }}
+          if-no-files-found: warn
+
+  delivery-result:
+    needs: [build-yoyoboot-docs, validate-yoyoboot-docs, docs-mirror-aliyun]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    outputs:
+      build-result: ${{ needs.build-yoyoboot-docs.result }}
+      validation-result: ${{ needs.validate-yoyoboot-docs.result }}
+      mirror-result: ${{ needs.docs-mirror-aliyun.result }}
+    steps:
+      - name: Record delivery results
+        env:
+          BUILD_RESULT: ${{ needs.build-yoyoboot-docs.result }}
+          VALIDATION_RESULT: ${{ needs.validate-yoyoboot-docs.result }}
+          MIRROR_RESULT: ${{ needs.docs-mirror-aliyun.result }}
+        run: printf 'Docs build=%s, validation=%s, mirrors=%s\n' "$BUILD_RESULT" "$VALIDATION_RESULT" "$MIRROR_RESULT" >> "$GITHUB_STEP_SUMMARY"

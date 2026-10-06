@@ -112,59 +112,6 @@ jobs:
             echo "build_target=$BUILD_TARGET"
           } >> "$GITHUB_OUTPUT"
 
-  quality-gate:
-    needs: [validate-request, image-scope]
-    if: ${{ needs.validate-request.outputs.build_intent == 'ci' && needs.image-scope.outputs.has_images == 'true' }}
-    runs-on: ubuntu-24.04
-    env:
-      SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
-      SOURCE_REF: ${{ needs.validate-request.outputs.source_ref }}
-      SOURCE_SHA: ${{ needs.validate-request.outputs.source_sha }}
-    steps:
-      - name: Check out requested private source revision
-        uses: actions/checkout@v6
-        with:
-          repository: ${{ env.SOURCE_REPOSITORY }}
-          ref: ${{ env.SOURCE_SHA }}
-          token: ${{ secrets.PRIVATE_SOURCE_PAT }}
-          path: source
-          fetch-depth: 1
-          persist-credentials: false
-      - name: Verify source branch still points to requested commit
-        shell: bash
-        env:
-          SOURCE_READ_TOKEN: ${{ secrets.PRIVATE_SOURCE_PAT }}
-        run: |
-          set -euo pipefail
-          [[ "$(git -C source rev-parse HEAD)" == "$SOURCE_SHA" ]]
-          remote_sha="$(curl --fail-with-body --silent --show-error \
-            --header 'Accept: application/vnd.github+json' \
-            --header "Authorization: Bearer ${SOURCE_READ_TOKEN}" \
-            --header 'X-GitHub-Api-Version: 2022-11-28' \
-            "${GITHUB_API_URL}/repos/${SOURCE_REPOSITORY}/commits/${SOURCE_REF}" | jq -r '.sha')"
-          [[ "$remote_sha" == "$SOURCE_SHA" ]] || { echo 'Source ref moved after dispatch.' >&2; exit 1; }
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 24.20.0
-          package-manager-cache: false
-      - uses: actions/setup-dotnet@v5
-        with:
-          dotnet-version: 10.0.x
-      - name: Run repository-owned build and test quality gate
-        shell: pwsh
-        working-directory: source
-        run: >-
-          ./scripts/public-build-runner/quality/Invoke-YoyoBootPublicQualityGate.ps1
-          -OutputDirectory "$env:RUNNER_TEMP/yoyoboot-quality-gate"
-          -SkipDocumentation
-      - name: Upload quality evidence
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: yoyoboot-quality-${{ env.SOURCE_SHA }}-${{ github.run_id }}
-          path: ${{ runner.temp }}/yoyoboot-quality-gate
-          if-no-files-found: warn
-
   image-scope:
     needs: validate-request
     runs-on: ubuntu-24.04
@@ -172,6 +119,7 @@ jobs:
       components_json: ${{ steps.scope.outputs.components_json }}
       has_images: ${{ steps.scope.outputs.has_images }}
       has_docs: ${{ steps.scope.outputs.has_docs }}
+      quality_scopes: ${{ steps.scope.outputs.quality_scopes }}
     env:
       SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
       SOURCE_REF: ${{ needs.validate-request.outputs.source_ref }}
@@ -221,529 +169,58 @@ jobs:
           path: ${{ runner.temp }}/yoyoboot-image-scope
           if-no-files-found: error
 
-  build-yoyoadmin-web:
+  quality-gate:
     needs: [validate-request, image-scope]
-    if: ${{ needs.validate-request.outputs.build_intent == 'image' && contains(fromJson(needs.image-scope.outputs.components_json), 'yoyoadmin-web') }}
-    runs-on: ubuntu-24.04
-    environment: oci-image-publisher
-    env:
-      SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
-      SOURCE_REF: ${{ needs.validate-request.outputs.source_ref }}
-      SOURCE_SHA: ${{ needs.validate-request.outputs.source_sha }}
-      COMPONENT_ID: yoyoadmin-web
-      COMPONENTS_JSON: '["yoyoadmin-web"]'
-      PRIMARY_REGISTRY: docker.io
-      PRIMARY_REPOSITORY_PREFIX: ${{ vars.DOCKERHUB_USERNAME }}
-    steps:
-      - name: Check out requested private source revision
-        uses: actions/checkout@v6
-        with:
-          repository: ${{ env.SOURCE_REPOSITORY }}
-          ref: ${{ env.SOURCE_SHA }}
-          token: ${{ secrets.PRIVATE_SOURCE_PAT }}
-          path: source
-          fetch-depth: 1
-          persist-credentials: false
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 24.20.0
-          package-manager-cache: false
-      - name: Validate Docker Hub primary configuration
-        shell: bash
-        env:
-          PRIMARY_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
-          PRIMARY_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          [[ -n "$PRIMARY_REPOSITORY_PREFIX" && -n "$PRIMARY_USERNAME" && -n "$PRIMARY_PASSWORD" ]] || {
-            echo 'Docker Hub primary registry configuration is required for image intent.' >&2
-            exit 1
-          }
-      - name: Sign in to Docker Hub primary
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.PRIMARY_REGISTRY }}
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Build and publish yoyoadmin-web exact-SHA image to primary
-        shell: pwsh
-        working-directory: source
-        run: >-
-          ./scripts/public-build-runner/images/Invoke-YoyoBootPublicImageBuild.ps1
-          -OutputDirectory "$env:RUNNER_TEMP/yoyoboot-public-build-$env:COMPONENT_ID"
-          -ImageRegistry "$env:PRIMARY_REGISTRY"
-          -ImageRepositoryPrefix "$env:PRIMARY_REPOSITORY_PREFIX"
-          -ComponentsJson "$env:COMPONENTS_JSON"
-          -PushImages
-      - name: Upload yoyoadmin-web primary manifest and build evidence
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: yoyoboot-image-yoyoadmin-web-${{ env.SOURCE_SHA }}-${{ github.run_id }}
-          path: ${{ runner.temp }}/yoyoboot-public-build-yoyoadmin-web
-          if-no-files-found: warn
+    if: ${{ needs.validate-request.outputs.build_intent == 'ci' && needs.image-scope.outputs.quality_scopes != '[]' }}
+    uses: ./.github/workflows/yoyoboot-quality.yml
+    with:
+      source-ref: ${{ needs.validate-request.outputs.source_ref }}
+      source-sha: ${{ needs.validate-request.outputs.source_sha }}
+      build-target: ${{ needs.validate-request.outputs.build_target }}
+      quality-scopes-json: ${{ needs.image-scope.outputs.quality_scopes }}
+    secrets:
+      PRIVATE_SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
+      PRIVATE_SOURCE_PAT: ${{ secrets.PRIVATE_SOURCE_PAT }}
 
-  build-yoyoadmin-hostapi:
+  admin-delivery:
     needs: [validate-request, image-scope]
-    if: ${{ needs.validate-request.outputs.build_intent == 'image' && contains(fromJson(needs.image-scope.outputs.components_json), 'yoyoadmin-hostapi') }}
-    runs-on: ubuntu-24.04
-    environment: oci-image-publisher
-    env:
-      SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
-      SOURCE_REF: ${{ needs.validate-request.outputs.source_ref }}
-      SOURCE_SHA: ${{ needs.validate-request.outputs.source_sha }}
-      COMPONENT_ID: yoyoadmin-hostapi
-      COMPONENTS_JSON: '["yoyoadmin-hostapi"]'
-      PRIMARY_REGISTRY: docker.io
-      PRIMARY_REPOSITORY_PREFIX: ${{ vars.DOCKERHUB_USERNAME }}
-    steps:
-      - name: Check out requested private source revision
-        uses: actions/checkout@v6
-        with:
-          repository: ${{ env.SOURCE_REPOSITORY }}
-          ref: ${{ env.SOURCE_SHA }}
-          token: ${{ secrets.PRIVATE_SOURCE_PAT }}
-          path: source
-          fetch-depth: 1
-          persist-credentials: false
-      - uses: actions/setup-dotnet@v5
-        with:
-          dotnet-version: 10.0.x
-      - name: Validate Docker Hub primary configuration
-        shell: bash
-        env:
-          PRIMARY_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
-          PRIMARY_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          [[ -n "$PRIMARY_REPOSITORY_PREFIX" && -n "$PRIMARY_USERNAME" && -n "$PRIMARY_PASSWORD" ]] || exit 1
-      - name: Sign in to Docker Hub primary
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.PRIMARY_REGISTRY }}
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Build and publish yoyoadmin-hostapi exact-SHA image to primary
-        shell: pwsh
-        working-directory: source
-        run: >-
-          ./scripts/public-build-runner/images/Invoke-YoyoBootPublicImageBuild.ps1
-          -OutputDirectory "$env:RUNNER_TEMP/yoyoboot-public-build-$env:COMPONENT_ID"
-          -ImageRegistry "$env:PRIMARY_REGISTRY"
-          -ImageRepositoryPrefix "$env:PRIMARY_REPOSITORY_PREFIX"
-          -ComponentsJson "$env:COMPONENTS_JSON"
-          -PushImages
-      - name: Upload yoyoadmin-hostapi primary manifest and build evidence
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: yoyoboot-image-yoyoadmin-hostapi-${{ env.SOURCE_SHA }}-${{ github.run_id }}
-          path: ${{ runner.temp }}/yoyoboot-public-build-yoyoadmin-hostapi
-          if-no-files-found: warn
+    if: ${{ needs.validate-request.outputs.build_intent == 'image' && needs.image-scope.outputs.has_images == 'true' }}
+    uses: ./.github/workflows/yoyoadmin-delivery.yml
+    with:
+      source-ref: ${{ needs.validate-request.outputs.source_ref }}
+      source-sha: ${{ needs.validate-request.outputs.source_sha }}
+      components-json: ${{ needs.image-scope.outputs.components_json }}
+    secrets:
+      PRIVATE_SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
+      PRIVATE_SOURCE_PAT: ${{ secrets.PRIVATE_SOURCE_PAT }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      ALIYUN_PASSWORD: ${{ secrets.ALIYUN_PASSWORD }}
 
-  build-yoyoadmin-migrator:
+  docs-delivery:
     needs: [validate-request, image-scope]
-    if: ${{ needs.validate-request.outputs.build_intent == 'image' && contains(fromJson(needs.image-scope.outputs.components_json), 'yoyoadmin-migrator') }}
-    runs-on: ubuntu-24.04
-    environment: oci-image-publisher
-    env:
-      SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
-      SOURCE_REF: ${{ needs.validate-request.outputs.source_ref }}
-      SOURCE_SHA: ${{ needs.validate-request.outputs.source_sha }}
-      COMPONENT_ID: yoyoadmin-migrator
-      COMPONENTS_JSON: '["yoyoadmin-migrator"]'
-      PRIMARY_REGISTRY: docker.io
-      PRIMARY_REPOSITORY_PREFIX: ${{ vars.DOCKERHUB_USERNAME }}
-    steps:
-      - name: Check out requested private source revision
-        uses: actions/checkout@v6
-        with:
-          repository: ${{ env.SOURCE_REPOSITORY }}
-          ref: ${{ env.SOURCE_SHA }}
-          token: ${{ secrets.PRIVATE_SOURCE_PAT }}
-          path: source
-          fetch-depth: 1
-          persist-credentials: false
-      - uses: actions/setup-dotnet@v5
-        with:
-          dotnet-version: 10.0.x
-      - name: Validate Docker Hub primary configuration
-        shell: bash
-        env:
-          PRIMARY_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
-          PRIMARY_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          [[ -n "$PRIMARY_REPOSITORY_PREFIX" && -n "$PRIMARY_USERNAME" && -n "$PRIMARY_PASSWORD" ]] || exit 1
-      - name: Sign in to Docker Hub primary
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.PRIMARY_REGISTRY }}
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Build and publish yoyoadmin-migrator exact-SHA image to primary
-        shell: pwsh
-        working-directory: source
-        run: >-
-          ./scripts/public-build-runner/images/Invoke-YoyoBootPublicImageBuild.ps1
-          -OutputDirectory "$env:RUNNER_TEMP/yoyoboot-public-build-$env:COMPONENT_ID"
-          -ImageRegistry "$env:PRIMARY_REGISTRY"
-          -ImageRepositoryPrefix "$env:PRIMARY_REPOSITORY_PREFIX"
-          -ComponentsJson "$env:COMPONENTS_JSON"
-          -PushImages
-      - name: Upload yoyoadmin-migrator primary manifest and build evidence
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: yoyoboot-image-yoyoadmin-migrator-${{ env.SOURCE_SHA }}-${{ github.run_id }}
-          path: ${{ runner.temp }}/yoyoboot-public-build-yoyoadmin-migrator
-          if-no-files-found: warn
-
-  build-yoyoboot-docs:
-    needs: [validate-request, image-scope]
-    if: ${{ needs.validate-request.outputs.build_intent == 'image' && needs.image-scope.outputs.has_docs == 'true' }}
-    runs-on: ubuntu-24.04
-    environment: oci-image-publisher
-    env:
-      SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
-      SOURCE_REF: ${{ needs.validate-request.outputs.source_ref }}
-      SOURCE_SHA: ${{ needs.validate-request.outputs.source_sha }}
-      COMPONENT_ID: yoyoboot-docs
-      COMPONENTS_JSON: '["yoyoboot-docs"]'
-      PRIMARY_REGISTRY: docker.io
-      PRIMARY_REPOSITORY_PREFIX: ${{ vars.DOCKERHUB_USERNAME }}
-    steps:
-      - name: Check out requested private source revision
-        uses: actions/checkout@v6
-        with:
-          repository: ${{ env.SOURCE_REPOSITORY }}
-          ref: ${{ env.SOURCE_SHA }}
-          token: ${{ secrets.PRIVATE_SOURCE_PAT }}
-          path: source
-          fetch-depth: 1
-          persist-credentials: false
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 24.20.0
-          package-manager-cache: false
-      - name: Validate Docker Hub primary configuration
-        shell: bash
-        env:
-          PRIMARY_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
-          PRIMARY_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          [[ -n "$PRIMARY_REPOSITORY_PREFIX" && -n "$PRIMARY_USERNAME" && -n "$PRIMARY_PASSWORD" ]] || exit 1
-      - name: Sign in to Docker Hub primary
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.PRIMARY_REGISTRY }}
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Build and publish yoyoboot-docs exact-SHA image to primary
-        shell: pwsh
-        working-directory: source
-        run: >-
-          ./scripts/public-build-runner/images/Invoke-YoyoBootDocsBuild.ps1
-          -OutputDirectory "$env:RUNNER_TEMP/yoyoboot-public-build-$env:COMPONENT_ID"
-          -ImageRegistry "$env:PRIMARY_REGISTRY"
-          -ImageRepositoryPrefix "$env:PRIMARY_REPOSITORY_PREFIX"
-          -PushImages
-      - name: Upload yoyoboot-docs primary manifest and build evidence
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: yoyoboot-image-yoyoboot-docs-${{ env.SOURCE_SHA }}-${{ github.run_id }}
-          path: ${{ runner.temp }}/yoyoboot-public-build-yoyoboot-docs
-          if-no-files-found: warn
-
-  validate-yoyoboot-docs:
-    needs: [validate-request, image-scope]
-    if: ${{ needs.validate-request.outputs.build_intent == 'ci' && needs.image-scope.outputs.has_docs == 'true' }}
-    runs-on: ubuntu-24.04
-    env:
-      SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
-      SOURCE_REF: ${{ needs.validate-request.outputs.source_ref }}
-      SOURCE_SHA: ${{ needs.validate-request.outputs.source_sha }}
-      COMPONENT_ID: yoyoboot-docs
-      COMPONENTS_JSON: '["yoyoboot-docs"]'
-    steps:
-      - name: Check out requested private source revision
-        uses: actions/checkout@v6
-        with:
-          repository: ${{ env.SOURCE_REPOSITORY }}
-          ref: ${{ env.SOURCE_SHA }}
-          token: ${{ secrets.PRIVATE_SOURCE_PAT }}
-          path: source
-          fetch-depth: 1
-          persist-credentials: false
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 24.20.0
-          package-manager-cache: false
-      - name: Validate independent documentation delivery
-        shell: pwsh
-        working-directory: source
-        run: >-
-          ./scripts/public-build-runner/images/Invoke-YoyoBootDocsBuild.ps1
-          -OutputDirectory "$env:RUNNER_TEMP/yoyoboot-docs-validation"
-
-  image-summary:
-    needs: [validate-request, image-scope, build-yoyoadmin-web, build-yoyoadmin-hostapi, build-yoyoadmin-migrator]
-    if: ${{ always() && needs.validate-request.outputs.build_intent == 'image' && needs.image-scope.result == 'success' }}
-    runs-on: ubuntu-24.04
-    outputs:
-      has_primary: ${{ steps.summary.outputs.has_primary }}
-      lane_result: ${{ steps.summary.outputs.lane_result }}
-    env:
-      SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
-      SOURCE_REF: ${{ needs.validate-request.outputs.source_ref }}
-      SOURCE_SHA: ${{ needs.validate-request.outputs.source_sha }}
-    steps:
-      - name: Check out image summary owner
-        uses: actions/checkout@v6
-        with:
-          repository: ${{ env.SOURCE_REPOSITORY }}
-          ref: ${{ env.SOURCE_SHA }}
-          token: ${{ secrets.PRIVATE_SOURCE_PAT }}
-          path: source
-          fetch-depth: 1
-          persist-credentials: false
-      - name: Download yoyoadmin-web manifest
-        if: ${{ needs.build-yoyoadmin-web.result == 'success' }}
-        uses: actions/download-artifact@v5
-        with:
-          name: yoyoboot-image-yoyoadmin-web-${{ env.SOURCE_SHA }}-${{ github.run_id }}
-          path: ${{ runner.temp }}/yoyoboot-primary-components/yoyoadmin-web
-      - name: Download yoyoadmin-hostapi manifest
-        if: ${{ needs.build-yoyoadmin-hostapi.result == 'success' }}
-        uses: actions/download-artifact@v5
-        with:
-          name: yoyoboot-image-yoyoadmin-hostapi-${{ env.SOURCE_SHA }}-${{ github.run_id }}
-          path: ${{ runner.temp }}/yoyoboot-primary-components/yoyoadmin-hostapi
-      - name: Download yoyoadmin-migrator manifest
-        if: ${{ needs.build-yoyoadmin-migrator.result == 'success' }}
-        uses: actions/download-artifact@v5
-        with:
-          name: yoyoboot-image-yoyoadmin-migrator-${{ env.SOURCE_SHA }}-${{ github.run_id }}
-          path: ${{ runner.temp }}/yoyoboot-primary-components/yoyoadmin-migrator
-      - name: Merge component results into image manifest
-        id: summary
-        shell: pwsh
-        working-directory: source
-        run: >-
-          ./scripts/public-build-runner/images/Merge-YoyoBootImagePrimaryResults.ps1
-          -InputDirectory "$env:RUNNER_TEMP/yoyoboot-primary-components"
-          -OutputDirectory "$env:RUNNER_TEMP/yoyoboot-image-summary"
-          -SourceSha "$env:SOURCE_SHA"
-          -SourceRef "$env:SOURCE_REF"
-          -SourceRepository "$env:SOURCE_REPOSITORY"
-          -ScopeComponentsJson '${{ needs.image-scope.outputs.components_json }}'
-          -WebResult '${{ needs.build-yoyoadmin-web.result }}'
-          -HostApiResult '${{ needs.build-yoyoadmin-hostapi.result }}'
-          -MigratorResult '${{ needs.build-yoyoadmin-migrator.result }}'
-      - name: Upload image summary manifest
-        uses: actions/upload-artifact@v4
-        with:
-          name: yoyoboot-image-summary-${{ env.SOURCE_SHA }}-${{ github.run_id }}
-          path: ${{ runner.temp }}/yoyoboot-image-summary
-          if-no-files-found: error
-
-  image-mirror-aliyun:
-    needs: [validate-request, image-summary]
-    if: ${{ always() && needs.validate-request.outputs.build_intent == 'image' && needs.image-summary.result == 'success' && needs.image-summary.outputs.has_primary == 'true' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - name: aliyun-chengdu
-            registry: ${{ vars.ALIYUN_DOCKERHUB }}
-          - name: aliyun-hong-kong
-            registry: ${{ vars.ALIYUN_HK_DOCKERHUB }}
-    runs-on: ubuntu-24.04
-    environment: oci-image-publisher
-    env:
-      SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
-      SOURCE_SHA: ${{ needs.validate-request.outputs.source_sha }}
-      TARGET_NAME: ${{ matrix.target.name }}
-      TARGET_REGISTRY: ${{ matrix.target.registry }}
-      TARGET_REPOSITORY_PREFIX: yoyosoft
-    steps:
-      - name: Check out mirror publication owner
-        uses: actions/checkout@v6
-        with:
-          repository: ${{ env.SOURCE_REPOSITORY }}
-          ref: ${{ env.SOURCE_SHA }}
-          token: ${{ secrets.PRIVATE_SOURCE_PAT }}
-          path: source
-          fetch-depth: 1
-          persist-credentials: false
-      - name: Download primary image summary
-        uses: actions/download-artifact@v5
-        with:
-          name: yoyoboot-image-summary-${{ env.SOURCE_SHA }}-${{ github.run_id }}
-          path: ${{ runner.temp }}/yoyoboot-primary-summary
-      - name: Validate Aliyun mirror configuration
-        shell: bash
-        env:
-          TARGET_USERNAME: ${{ vars.ALIYUN_USERNAME }}
-          TARGET_PASSWORD: ${{ secrets.ALIYUN_PASSWORD }}
-        run: |
-          set -euo pipefail
-          [[ -n "$TARGET_REGISTRY" && -n "$TARGET_USERNAME" && -n "$TARGET_PASSWORD" ]] || {
-            echo "Aliyun mirror configuration is required for ${TARGET_NAME}." >&2
-            exit 1
-          }
-      - name: Sign in to Aliyun mirror
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.TARGET_REGISTRY }}
-          username: ${{ vars.ALIYUN_USERNAME }}
-          password: ${{ secrets.ALIYUN_PASSWORD }}
-      - name: Mirror exact-SHA images and verify digest identity
-        shell: pwsh
-        working-directory: source
-        run: >-
-          ./apps/yoyo-admin/packaging/Publish-YoyoAdminImageMirror.ps1
-          -PrimaryManifestPath "$env:RUNNER_TEMP/yoyoboot-primary-summary/image-manifest.json"
-          -TargetRegistry "$env:TARGET_REGISTRY"
-          -TargetRepositoryPrefix "$env:TARGET_REPOSITORY_PREFIX"
-          -TargetName "$env:TARGET_NAME"
-          -OutputDirectory "$env:RUNNER_TEMP/yoyoboot-image-mirror-$env:TARGET_NAME"
-      - name: Upload mirror evidence
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: yoyoboot-images-${{ env.TARGET_NAME }}-${{ env.SOURCE_SHA }}-${{ github.run_id }}
-          path: ${{ runner.temp }}/yoyoboot-image-mirror-${{ env.TARGET_NAME }}
-          if-no-files-found: warn
-
-  docs-mirror-aliyun:
-    needs: [validate-request, build-yoyoboot-docs]
-    if: ${{ always() && needs.validate-request.outputs.build_intent == 'image' && needs.build-yoyoboot-docs.result == 'success' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - name: aliyun-chengdu
-            registry: ${{ vars.ALIYUN_DOCKERHUB }}
-          - name: aliyun-hong-kong
-            registry: ${{ vars.ALIYUN_HK_DOCKERHUB }}
-    runs-on: ubuntu-24.04
-    environment: oci-image-publisher
-    env:
-      SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
-      SOURCE_SHA: ${{ needs.validate-request.outputs.source_sha }}
-      TARGET_NAME: ${{ matrix.target.name }}
-      TARGET_REGISTRY: ${{ matrix.target.registry }}
-      TARGET_REPOSITORY_PREFIX: yoyosoft
-    steps:
-      - name: Check out mirror publication owner
-        uses: actions/checkout@v6
-        with:
-          repository: ${{ env.SOURCE_REPOSITORY }}
-          ref: ${{ env.SOURCE_SHA }}
-          token: ${{ secrets.PRIVATE_SOURCE_PAT }}
-          path: source
-          fetch-depth: 1
-          persist-credentials: false
-      - name: Download primary image summary
-        uses: actions/download-artifact@v5
-        with:
-          name: yoyoboot-image-yoyoboot-docs-${{ env.SOURCE_SHA }}-${{ github.run_id }}
-          path: ${{ runner.temp }}/yoyoboot-docs-primary
-      - name: Validate Aliyun mirror configuration
-        shell: bash
-        env:
-          TARGET_USERNAME: ${{ vars.ALIYUN_USERNAME }}
-          TARGET_PASSWORD: ${{ secrets.ALIYUN_PASSWORD }}
-        run: |
-          set -euo pipefail
-          [[ -n "$TARGET_REGISTRY" && -n "$TARGET_USERNAME" && -n "$TARGET_PASSWORD" ]] || {
-            echo "Aliyun mirror configuration is required for ${TARGET_NAME}." >&2
-            exit 1
-          }
-      - name: Sign in to Aliyun mirror
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.TARGET_REGISTRY }}
-          username: ${{ vars.ALIYUN_USERNAME }}
-          password: ${{ secrets.ALIYUN_PASSWORD }}
-      - name: Mirror exact-SHA images and verify digest identity
-        shell: pwsh
-        working-directory: source
-        run: >-
-          ./scripts/public-build-runner/images/Publish-YoyoBootImageMirror.ps1
-          -PrimaryManifestPath "$env:RUNNER_TEMP/yoyoboot-docs-primary/images/image-manifest.json"
-          -TargetRegistry "$env:TARGET_REGISTRY"
-          -TargetRepositoryPrefix "$env:TARGET_REPOSITORY_PREFIX"
-          -TargetName "$env:TARGET_NAME"
-          -OutputDirectory "$env:RUNNER_TEMP/yoyoboot-docs-mirror-$env:TARGET_NAME"
-      - name: Upload mirror evidence
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: yoyoboot-docs-images-${{ env.TARGET_NAME }}-${{ env.SOURCE_SHA }}-${{ github.run_id }}
-          path: ${{ runner.temp }}/yoyoboot-docs-mirror-${{ env.TARGET_NAME }}
-          if-no-files-found: warn
+    if: ${{ needs.image-scope.outputs.has_docs == 'true' }}
+    uses: ./.github/workflows/yoyoboot-docs-delivery.yml
+    with:
+      source-ref: ${{ needs.validate-request.outputs.source_ref }}
+      source-sha: ${{ needs.validate-request.outputs.source_sha }}
+      build-intent: ${{ needs.validate-request.outputs.build_intent }}
+    secrets:
+      PRIVATE_SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
+      PRIVATE_SOURCE_PAT: ${{ secrets.PRIVATE_SOURCE_PAT }}
+      DOCKERHUB_TOKEN: ${{ needs.validate-request.outputs.build_intent == 'image' && secrets.DOCKERHUB_TOKEN || '' }}
+      ALIYUN_PASSWORD: ${{ needs.validate-request.outputs.build_intent == 'image' && secrets.ALIYUN_PASSWORD || '' }}
 
   notify:
-    needs: [validate-request, quality-gate, image-scope, build-yoyoadmin-web, build-yoyoadmin-hostapi, build-yoyoadmin-migrator, build-yoyoboot-docs, validate-yoyoboot-docs, image-summary, image-mirror-aliyun, docs-mirror-aliyun]
+    needs: [validate-request, image-scope, quality-gate, admin-delivery, docs-delivery]
     if: ${{ always() && needs.validate-request.result == 'success' }}
-    continue-on-error: true
-    runs-on: ubuntu-24.04
-    env:
-      SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
-      SOURCE_REF: ${{ needs.validate-request.outputs.source_ref }}
-      SOURCE_SHA: ${{ needs.validate-request.outputs.source_sha }}
-      BUILD_INTENT: ${{ needs.validate-request.outputs.build_intent }}
-      BUILD_NOTIFY_PROVIDER: ${{ vars.BUILD_NOTIFY_PROVIDER }}
+    uses: ./.github/workflows/yoyoboot-notify.yml
+    with:
+      source-ref: ${{ needs.validate-request.outputs.source_ref }}
+      source-sha: ${{ needs.validate-request.outputs.source_sha }}
+      build-intent: ${{ needs.validate-request.outputs.build_intent }}
+      results-json: ${{ toJSON(needs) }}
+    secrets:
+      PRIVATE_SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
+      PRIVATE_SOURCE_PAT: ${{ secrets.PRIVATE_SOURCE_PAT }}
       BUILD_NOTIFY_WEBHOOK: ${{ secrets.BUILD_NOTIFY_WEBHOOK }}
       BUILD_NOTIFY_SECRET: ${{ secrets.BUILD_NOTIFY_SECRET }}
-    steps:
-      - name: Check out notification owner
-        uses: actions/checkout@v6
-        with:
-          repository: ${{ env.SOURCE_REPOSITORY }}
-          ref: ${{ env.SOURCE_SHA }}
-          token: ${{ secrets.PRIVATE_SOURCE_PAT }}
-          path: source
-          fetch-depth: 1
-          persist-credentials: false
-      - name: Download Admin notification evidence
-        if: ${{ needs.image-summary.outputs.has_primary == 'true' }}
-        uses: actions/download-artifact@v5
-        with:
-          name: yoyoboot-image-summary-${{ env.SOURCE_SHA }}-${{ github.run_id }}
-          path: ${{ runner.temp }}/yoyoboot-notification-primary/admin
-      - name: Download Docs notification evidence
-        if: ${{ needs.build-yoyoboot-docs.result == 'success' }}
-        uses: actions/download-artifact@v5
-        with:
-          name: yoyoboot-image-yoyoboot-docs-${{ env.SOURCE_SHA }}-${{ github.run_id }}
-          path: ${{ runner.temp }}/yoyoboot-notification-primary/docs
-      - name: Notify DingTalk or Feishu
-        continue-on-error: true
-        shell: pwsh
-        working-directory: source
-        run: >-
-          ./scripts/public-build-runner/notifications/Send-YoyoBootBuildNotification.ps1
-          -Provider "$env:BUILD_NOTIFY_PROVIDER"
-          -WebhookUrl "$env:BUILD_NOTIFY_WEBHOOK"
-          -WebhookSecret "$env:BUILD_NOTIFY_SECRET"
-          -SourceRepository "$env:SOURCE_REPOSITORY"
-          -SourceRef "$env:SOURCE_REF"
-          -SourceSha "$env:SOURCE_SHA"
-          -BuildIntent "$env:BUILD_INTENT"
-          -QualityResult '${{ needs.quality-gate.result }}'
-          -ImageResult '${{ needs.image-summary.outputs.lane_result }}'
-          -ImageComponentsJson '${{ needs.image-scope.outputs.components_json }}'
-          -ScopeResult '${{ needs.image-scope.result }}'
-          -DocsResult '${{ needs.build-yoyoboot-docs.result }}'
-          -DocsValidationResult '${{ needs.validate-yoyoboot-docs.result }}'
-          -DocsMirrorResult '${{ needs.docs-mirror-aliyun.result }}'
-          -DocsSelected:$${{ needs.image-scope.outputs.has_docs == 'true' }}
-          -PrimaryManifestsDirectory "$env:RUNNER_TEMP/yoyoboot-notification-primary"
-          -ComponentResultsJson '{"yoyoadmin-web":"${{ needs.build-yoyoadmin-web.result }}","yoyoadmin-hostapi":"${{ needs.build-yoyoadmin-hostapi.result }}","yoyoadmin-migrator":"${{ needs.build-yoyoadmin-migrator.result }}"}'
-          -MirrorResult '${{ needs.image-mirror-aliyun.result }}'
-          -WorkflowUrl '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
