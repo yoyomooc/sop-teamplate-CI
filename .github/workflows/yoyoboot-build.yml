@@ -325,6 +325,64 @@ jobs:
           path: ${{ runner.temp }}/yoyoboot-public-build-yoyoadmin-hostapi
           if-no-files-found: warn
 
+  build-yoyoadmin-migrator:
+    needs: [validate-request, image-scope]
+    if: ${{ needs.validate-request.outputs.build_intent == 'image' && contains(fromJson(needs.image-scope.outputs.components_json), 'yoyoadmin-migrator') }}
+    runs-on: ubuntu-24.04
+    environment: oci-image-publisher
+    env:
+      SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
+      SOURCE_REF: ${{ needs.validate-request.outputs.source_ref }}
+      SOURCE_SHA: ${{ needs.validate-request.outputs.source_sha }}
+      COMPONENT_ID: yoyoadmin-migrator
+      COMPONENTS_JSON: '["yoyoadmin-migrator"]'
+      PRIMARY_REGISTRY: docker.io
+      PRIMARY_REPOSITORY_PREFIX: ${{ vars.DOCKERHUB_USERNAME }}
+    steps:
+      - name: Check out requested private source revision
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ env.SOURCE_SHA }}
+          token: ${{ secrets.PRIVATE_SOURCE_PAT }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+      - name: Validate Docker Hub primary configuration
+        shell: bash
+        env:
+          PRIMARY_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          PRIMARY_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ -n "$PRIMARY_REPOSITORY_PREFIX" && -n "$PRIMARY_USERNAME" && -n "$PRIMARY_PASSWORD" ]] || exit 1
+      - name: Sign in to Docker Hub primary
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.PRIMARY_REGISTRY }}
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build and publish yoyoadmin-migrator exact-SHA image to primary
+        shell: pwsh
+        working-directory: source
+        run: >-
+          ./scripts/public-build-runner/images/Invoke-YoyoBootPublicImageBuild.ps1
+          -OutputDirectory "$env:RUNNER_TEMP/yoyoboot-public-build-$env:COMPONENT_ID"
+          -ImageRegistry "$env:PRIMARY_REGISTRY"
+          -ImageRepositoryPrefix "$env:PRIMARY_REPOSITORY_PREFIX"
+          -ComponentsJson "$env:COMPONENTS_JSON"
+          -PushImages
+      - name: Upload yoyoadmin-migrator primary manifest and build evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: yoyoboot-image-yoyoadmin-migrator-${{ env.SOURCE_SHA }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/yoyoboot-public-build-yoyoadmin-migrator
+          if-no-files-found: warn
+
   build-yoyoadmin-docs:
     needs: [validate-request, image-scope]
     if: ${{ needs.validate-request.outputs.build_intent == 'image' && contains(fromJson(needs.image-scope.outputs.components_json), 'yoyoadmin-docs') }}
@@ -385,7 +443,7 @@ jobs:
           if-no-files-found: warn
 
   image-summary:
-    needs: [validate-request, image-scope, build-yoyoadmin-web, build-yoyoadmin-hostapi, build-yoyoadmin-docs]
+    needs: [validate-request, image-scope, build-yoyoadmin-web, build-yoyoadmin-hostapi, build-yoyoadmin-migrator, build-yoyoadmin-docs]
     if: ${{ always() && needs.validate-request.outputs.build_intent == 'image' && needs.image-scope.result == 'success' }}
     runs-on: ubuntu-24.04
     outputs:
@@ -417,6 +475,12 @@ jobs:
         with:
           name: yoyoboot-image-yoyoadmin-hostapi-${{ env.SOURCE_SHA }}-${{ github.run_id }}
           path: ${{ runner.temp }}/yoyoboot-primary-components/yoyoadmin-hostapi
+      - name: Download yoyoadmin-migrator manifest
+        if: ${{ needs.build-yoyoadmin-migrator.result == 'success' }}
+        uses: actions/download-artifact@v5
+        with:
+          name: yoyoboot-image-yoyoadmin-migrator-${{ env.SOURCE_SHA }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/yoyoboot-primary-components/yoyoadmin-migrator
       - name: Download yoyoadmin-docs manifest
         if: ${{ needs.build-yoyoadmin-docs.result == 'success' }}
         uses: actions/download-artifact@v5
@@ -437,6 +501,7 @@ jobs:
           -ScopeComponentsJson '${{ needs.image-scope.outputs.components_json }}'
           -WebResult '${{ needs.build-yoyoadmin-web.result }}'
           -HostApiResult '${{ needs.build-yoyoadmin-hostapi.result }}'
+          -MigratorResult '${{ needs.build-yoyoadmin-migrator.result }}'
           -DocsResult '${{ needs.build-yoyoadmin-docs.result }}'
       - name: Upload image summary manifest
         uses: actions/upload-artifact@v4
@@ -515,7 +580,7 @@ jobs:
           if-no-files-found: warn
 
   notify:
-    needs: [validate-request, quality-gate, image-scope, build-yoyoadmin-web, build-yoyoadmin-hostapi, build-yoyoadmin-docs, image-summary, image-mirror-aliyun]
+    needs: [validate-request, quality-gate, image-scope, build-yoyoadmin-web, build-yoyoadmin-hostapi, build-yoyoadmin-migrator, build-yoyoadmin-docs, image-summary, image-mirror-aliyun]
     if: ${{ always() && needs.validate-request.result == 'success' }}
     continue-on-error: true
     runs-on: ubuntu-24.04
@@ -553,5 +618,7 @@ jobs:
           -QualityResult '${{ needs.quality-gate.result }}'
           -ImageResult '${{ needs.image-summary.outputs.lane_result }}'
           -ImageComponentsJson '${{ needs.image-scope.outputs.components_json }}'
+          -ScopeResult '${{ needs.image-scope.result }}'
+          -ComponentResultsJson '{"yoyoadmin-web":"${{ needs.build-yoyoadmin-web.result }}","yoyoadmin-hostapi":"${{ needs.build-yoyoadmin-hostapi.result }}","yoyoadmin-migrator":"${{ needs.build-yoyoadmin-migrator.result }}","yoyoadmin-docs":"${{ needs.build-yoyoadmin-docs.result }}"}'
           -MirrorResult '${{ needs.image-mirror-aliyun.result }}'
           -WorkflowUrl '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
