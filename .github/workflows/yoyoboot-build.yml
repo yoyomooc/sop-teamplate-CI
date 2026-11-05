@@ -1,4 +1,5 @@
 name: build private YoyoBoot source
+run-name: ${{ github.event.client_payload.request.build_intent == 'ci' && '提交编译与测试' || '应用镜像交付' }} · ${{ github.event.client_payload.source_ref }} · ${{ github.event.client_payload.source_sha }}
 
 on:
   repository_dispatch:
@@ -18,6 +19,7 @@ jobs:
       source_ref: ${{ steps.validate.outputs.source_ref }}
       source_sha: ${{ steps.validate.outputs.source_sha }}
       source_before_sha: ${{ steps.validate.outputs.source_before_sha }}
+      source_run_id: ${{ steps.validate.outputs.source_run_id }}
       build_intent: ${{ steps.validate.outputs.build_intent }}
       build_target: ${{ steps.validate.outputs.build_target }}
     steps:
@@ -108,18 +110,84 @@ jobs:
             echo "source_ref=$SOURCE_REF"
             echo "source_sha=$SOURCE_SHA"
             echo "source_before_sha=$SOURCE_BEFORE_SHA"
+            echo "source_run_id=$SOURCE_RUN_ID"
             echo "build_intent=$BUILD_INTENT"
             echo "build_target=$BUILD_TARGET"
           } >> "$GITHUB_OUTPUT"
 
+  quality-plan:
+    needs: validate-request
+    if: ${{ needs.validate-request.outputs.build_intent == 'ci' }}
+    runs-on: ubuntu-24.04
+    outputs:
+      has_docs: ${{ steps.scope.outputs.has_docs }}
+      quality_scopes: ${{ steps.scope.outputs.quality_scopes }}
+    env:
+      SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
+      SOURCE_REF: ${{ needs.validate-request.outputs.source_ref }}
+      SOURCE_SHA: ${{ needs.validate-request.outputs.source_sha }}
+      SOURCE_BEFORE_SHA: ${{ needs.validate-request.outputs.source_before_sha }}
+      SOURCE_RUN_ID: ${{ needs.validate-request.outputs.source_run_id }}
+    steps:
+      - name: Check out requested private source range
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ env.SOURCE_SHA }}
+          token: ${{ secrets.PRIVATE_SOURCE_PAT }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify requested validation source
+        shell: bash
+        env:
+          SOURCE_READ_TOKEN: ${{ secrets.PRIVATE_SOURCE_PAT }}
+        run: |
+          set -euo pipefail
+          [[ "$(git -C source rev-parse HEAD)" == "$SOURCE_SHA" ]]
+          remote_sha="$(curl --fail-with-body --silent --show-error \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer ${SOURCE_READ_TOKEN}" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "${GITHUB_API_URL}/repos/${SOURCE_REPOSITORY}/commits/${SOURCE_REF}" | jq -r '.sha')"
+          [[ "$remote_sha" == "$SOURCE_SHA" ]] || { echo 'Source ref moved after validation dispatch.' >&2; exit 1; }
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '26'
+          package-manager-cache: false
+      - name: Install global pnpm
+        run: npm install --global pnpm@12.16.1
+      - name: Plan submission compilation and tests
+        id: scope
+        shell: pwsh
+        working-directory: source
+        run: |
+          $scopeArgs = @{ BaseSha = $env:SOURCE_BEFORE_SHA; HeadSha = $env:SOURCE_SHA; OutputPath = "$env:RUNNER_TEMP/yoyoboot-quality-plan/quality-scope.json" }
+          if ('${{ needs.validate-request.outputs.build_target }}' -eq 'docs') { $scopeArgs.ChangedPath = @() }
+          ./scripts/public-build-runner/quality/Resolve-YoyoBootQualityScope.ps1 @scopeArgs
+          ./scripts/public-build-runner/quality/Invoke-YoyoBootPublicQualityGate.ps1 -OutputDirectory "$env:RUNNER_TEMP/yoyoboot-quality-gate" -ScopePlanPath $scopeArgs.OutputPath -SkipDocumentation -PlanOnly |
+            Set-Content "$env:RUNNER_TEMP/yoyoboot-quality-plan/validation-plan.json" -Encoding utf8
+          $docs = & node ./tools/documentation/delivery-scope.mjs "$env:SOURCE_BEFORE_SHA" "$env:SOURCE_SHA"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot determine documentation scope.' }
+          $hasDocs = ($docs | ConvertFrom-Json).hasDocs
+          if ('${{ needs.validate-request.outputs.build_target }}' -in @('docs', 'all')) { $hasDocs = $true }
+          Add-Content $env:GITHUB_OUTPUT "has_docs=$($hasDocs.ToString().ToLowerInvariant())"
+      - name: Upload submission validation scope
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: yoyoboot-quality-plan-${{ env.SOURCE_SHA }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/yoyoboot-quality-plan
+          if-no-files-found: error
+
   image-scope:
     needs: validate-request
+    if: ${{ needs.validate-request.outputs.build_intent == 'image' }}
     runs-on: ubuntu-24.04
     outputs:
       components_json: ${{ steps.scope.outputs.components_json }}
       has_images: ${{ steps.scope.outputs.has_images }}
       has_docs: ${{ steps.scope.outputs.has_docs }}
-      quality_scopes: ${{ steps.scope.outputs.quality_scopes }}
     env:
       SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
       SOURCE_REF: ${{ needs.validate-request.outputs.source_ref }}
@@ -172,14 +240,15 @@ jobs:
           if-no-files-found: error
 
   quality-gate:
-    needs: [validate-request, image-scope]
-    if: ${{ needs.validate-request.outputs.build_intent == 'ci' && needs.image-scope.outputs.quality_scopes != '[]' }}
+    needs: [validate-request, quality-plan]
+    if: ${{ needs.validate-request.outputs.build_intent == 'ci' && needs.quality-plan.outputs.quality_scopes != '[]' }}
     uses: ./.github/workflows/yoyoboot-quality.yml
     with:
       source-ref: ${{ needs.validate-request.outputs.source_ref }}
       source-sha: ${{ needs.validate-request.outputs.source_sha }}
+      source-run-id: ${{ needs.validate-request.outputs.source_run_id }}
       build-target: ${{ needs.validate-request.outputs.build_target }}
-      quality-scopes-json: ${{ needs.image-scope.outputs.quality_scopes }}
+      quality-scopes-json: ${{ needs.quality-plan.outputs.quality_scopes }}
     secrets:
       PRIVATE_SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
       PRIVATE_SOURCE_PAT: ${{ secrets.PRIVATE_SOURCE_PAT }}
@@ -199,8 +268,8 @@ jobs:
       ALIYUN_PASSWORD: ${{ secrets.ALIYUN_PASSWORD }}
 
   docs-delivery:
-    needs: [validate-request, image-scope]
-    if: ${{ needs.image-scope.outputs.has_docs == 'true' }}
+    needs: [validate-request, quality-plan, image-scope]
+    if: ${{ always() && needs.validate-request.result == 'success' && (needs.quality-plan.outputs.has_docs == 'true' || needs.image-scope.outputs.has_docs == 'true') }}
     uses: ./.github/workflows/yoyoboot-docs-delivery.yml
     with:
       source-ref: ${{ needs.validate-request.outputs.source_ref }}
@@ -213,7 +282,7 @@ jobs:
       ALIYUN_PASSWORD: ${{ needs.validate-request.outputs.build_intent == 'image' && secrets.ALIYUN_PASSWORD || '' }}
 
   notify:
-    needs: [validate-request, image-scope, quality-gate, admin-delivery, docs-delivery]
+    needs: [validate-request, quality-plan, image-scope, quality-gate, admin-delivery, docs-delivery]
     if: ${{ always() && needs.validate-request.result == 'success' }}
     uses: ./.github/workflows/yoyoboot-notify.yml
     with:

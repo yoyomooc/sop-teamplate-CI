@@ -1,4 +1,4 @@
-name: YoyoBoot quality
+name: 提交编译与测试
 
 on:
   workflow_call:
@@ -7,6 +7,9 @@ on:
         type: string
         required: true
       source-sha:
+        type: string
+        required: true
+      source-run-id:
         type: string
         required: true
       build-target:
@@ -33,6 +36,7 @@ jobs:
       SOURCE_REPOSITORY: ${{ secrets.PRIVATE_SOURCE_REPOSITORY }}
       SOURCE_REF: ${{ inputs.source-ref }}
       SOURCE_SHA: ${{ inputs.source-sha }}
+      SOURCE_RUN_ID: ${{ inputs.source-run-id }}
     steps:
       - name: Check out requested private source revision
         uses: actions/checkout@v6
@@ -69,13 +73,32 @@ jobs:
         shell: bash
         working-directory: source
         run: echo "SDK $(dotnet --version); source $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Download selected engineering scope
+        uses: actions/download-artifact@v5
+        with:
+          name: yoyoboot-quality-plan-${{ env.SOURCE_SHA }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/yoyoboot-quality-plan
+      - name: Start required Redis test service
+        if: ${{ contains(fromJSON(inputs.quality-scopes-json), 'redis') || contains(fromJSON(inputs.quality-scopes-json), 'backend-compat') || contains(fromJSON(inputs.quality-scopes-json), 'full') }}
+        shell: bash
+        run: |
+          docker run -d --name yoyo-quality-redis -p 127.0.0.1:16389:6379 redis:7.4.1
+          for attempt in {1..30}; do
+            if docker exec yoyo-quality-redis redis-cli ping | grep -q PONG; then
+              echo 'YOYO_LEASE_TEST_REDIS=127.0.0.1:16389,allowAdmin=true' >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs yoyo-quality-redis
+          exit 1
       - name: Run repository-owned build and test quality gate
         shell: pwsh
         working-directory: source
         run: >-
           ./scripts/public-build-runner/quality/Invoke-YoyoBootPublicQualityGate.ps1
           -OutputDirectory "$env:RUNNER_TEMP/yoyoboot-quality-gate"
-          -ScopesJson '${{ inputs.quality-scopes-json }}'
+          -ScopePlanPath "$env:RUNNER_TEMP/yoyoboot-quality-plan/quality-scope.json"
           -SkipDocumentation
       - name: Upload quality evidence
         if: ${{ always() }}
@@ -84,3 +107,6 @@ jobs:
           name: yoyoboot-quality-${{ env.SOURCE_SHA }}-${{ github.run_id }}
           path: ${{ runner.temp }}/yoyoboot-quality-gate
           if-no-files-found: warn
+      - name: Stop owned Redis test service
+        if: ${{ always() && (contains(fromJSON(inputs.quality-scopes-json), 'redis') || contains(fromJSON(inputs.quality-scopes-json), 'backend-compat') || contains(fromJSON(inputs.quality-scopes-json), 'full')) }}
+        run: docker rm -f yoyo-quality-redis
