@@ -150,8 +150,10 @@ jobs:
           [[ "$remote_sha" == "$SOURCE_SHA" ]] || { echo 'Source ref moved after image dispatch.' >&2; exit 1; }
       - uses: actions/setup-node@v6
         with:
-          node-version: 24.20.0
+          node-version: '26'
           package-manager-cache: false
+      - name: Install global pnpm
+        run: npm install --global pnpm@12.16.1
       - name: Resolve dependency-aware application image scope
         id: scope
         shell: pwsh

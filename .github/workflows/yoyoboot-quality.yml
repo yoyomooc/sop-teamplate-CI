@@ -58,11 +58,17 @@ jobs:
           [[ "$remote_sha" == "$SOURCE_SHA" ]] || { echo 'Source ref moved after dispatch.' >&2; exit 1; }
       - uses: actions/setup-node@v6
         with:
-          node-version: 24.20.0
+          node-version: '26'
           package-manager-cache: false
+      - name: Install global pnpm
+        run: npm install --global pnpm@12.16.1
       - uses: actions/setup-dotnet@v5
         with:
-          dotnet-version: 10.0.x
+          global-json-file: source/global.json
+      - name: Record .NET SDK and source
+        shell: bash
+        working-directory: source
+        run: echo "SDK $(dotnet --version); source $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
       - name: Run repository-owned build and test quality gate
         shell: pwsh
         working-directory: source
