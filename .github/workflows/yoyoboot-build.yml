@@ -1,5 +1,5 @@
 name: build private YoyoBoot source
-run-name: ${{ github.event.client_payload.request.build_target == 'docs' && github.event.client_payload.request.build_intent == 'ci' && '文档验证' || github.event.client_payload.request.build_intent == 'ci' && '提交编译与测试' || '应用镜像交付' }} · ${{ github.event.client_payload.source_ref }} · ${{ github.event.client_payload.source_sha }}
+run-name: ${{ github.event.client_payload.request.build_target == 'docs' && github.event.client_payload.request.build_intent == 'ci' && '文档验证' || github.event.client_payload.request.build_intent == 'ci' && '提交检查' || '应用镜像交付' }} · ${{ github.event.client_payload.source_ref }} · ${{ github.event.client_payload.source_sha }}
 
 on:
   repository_dispatch:
