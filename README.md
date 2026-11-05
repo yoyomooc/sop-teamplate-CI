@@ -1,5 +1,8 @@
 # sop-teamplate
 
+https://github.com/yoyomooc/sop-teamplate-CI
+
+https://github.com/yoyomooc/sop-teamplate-CI/actions
 
 ![GitHub last commit](https://img.shields.io/github/last-commit/yoyomooc/sop-teamplate-CI)
 ![GitHub commit activity](https://img.shields.io/github/commit-activity/m/yoyomooc/sop-teamplate-CI)
