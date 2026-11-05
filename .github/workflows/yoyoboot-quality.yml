@@ -15,9 +15,6 @@ on:
       build-target:
         type: string
         required: true
-      quality-scopes-json:
-        type: string
-        required: true
     secrets:
       PRIVATE_SOURCE_REPOSITORY:
         required: true
@@ -60,26 +57,40 @@ jobs:
             --header 'X-GitHub-Api-Version: 2022-11-28' \
             "${GITHUB_API_URL}/repos/${SOURCE_REPOSITORY}/commits/${SOURCE_REF}" | jq -r '.sha')"
           [[ "$remote_sha" == "$SOURCE_SHA" ]] || { echo 'Source ref moved after dispatch.' >&2; exit 1; }
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '26'
-          package-manager-cache: false
-      - name: Install global pnpm
-        run: npm install --global pnpm@12.16.1
-      - uses: actions/setup-dotnet@v5
-        with:
-          global-json-file: source/global.json
-      - name: Record .NET SDK and source
-        shell: bash
-        working-directory: source
-        run: echo "SDK $(dotnet --version); source $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
       - name: Download selected engineering scope
         uses: actions/download-artifact@v5
         with:
           name: yoyoboot-quality-plan-${{ env.SOURCE_SHA }}-${{ github.run_id }}
           path: ${{ runner.temp }}/yoyoboot-quality-plan
+      - name: Read planned runtime requirements
+        id: runtime
+        shell: pwsh
+        run: |
+          $plan = Get-Content "$env:RUNNER_TEMP/yoyoboot-quality-plan/validation-plan.json" -Raw | ConvertFrom-Json
+          $node = $plan.runtime.node
+          $dotnet = $plan.runtime.dotnet
+          Add-Content $env:GITHUB_OUTPUT "node=$($node.ToString().ToLowerInvariant())"
+          Add-Content $env:GITHUB_OUTPUT "dotnet=$($dotnet.ToString().ToLowerInvariant())"
+          Add-Content $env:GITHUB_OUTPUT "redis=$($plan.runtime.redis.ToString().ToLowerInvariant())"
+      - uses: actions/setup-node@v6
+        if: ${{ steps.runtime.outputs.node == 'true' }}
+        with:
+          node-version: '26'
+          package-manager-cache: false
+      - name: Install global pnpm
+        if: ${{ steps.runtime.outputs.node == 'true' }}
+        run: npm install --global pnpm@12.16.1
+      - uses: actions/setup-dotnet@v5
+        if: ${{ steps.runtime.outputs.dotnet == 'true' }}
+        with:
+          global-json-file: source/global.json
+      - name: Record .NET SDK and source
+        if: ${{ steps.runtime.outputs.dotnet == 'true' }}
+        shell: bash
+        working-directory: source
+        run: echo "SDK $(dotnet --version); source $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
       - name: Start required Redis test service
-        if: ${{ contains(fromJSON(inputs.quality-scopes-json), 'redis') || contains(fromJSON(inputs.quality-scopes-json), 'backend-compat') || contains(fromJSON(inputs.quality-scopes-json), 'full') }}
+        if: ${{ steps.runtime.outputs.redis == 'true' }}
         shell: bash
         run: |
           docker run -d --name yoyo-quality-redis -p 127.0.0.1:16389:6379 redis:7.4.1
@@ -99,7 +110,6 @@ jobs:
           ./scripts/public-build-runner/quality/Invoke-YoyoBootPublicQualityGate.ps1
           -OutputDirectory "$env:RUNNER_TEMP/yoyoboot-quality-gate"
           -ScopePlanPath "$env:RUNNER_TEMP/yoyoboot-quality-plan/quality-scope.json"
-          -SkipDocumentation
       - name: Upload quality evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
@@ -108,5 +118,5 @@ jobs:
           path: ${{ runner.temp }}/yoyoboot-quality-gate
           if-no-files-found: warn
       - name: Stop owned Redis test service
-        if: ${{ always() && (contains(fromJSON(inputs.quality-scopes-json), 'redis') || contains(fromJSON(inputs.quality-scopes-json), 'backend-compat') || contains(fromJSON(inputs.quality-scopes-json), 'full')) }}
+        if: ${{ always() && steps.runtime.outputs.redis == 'true' }}
         run: docker rm -f yoyo-quality-redis

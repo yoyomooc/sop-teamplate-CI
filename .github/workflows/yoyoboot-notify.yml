@@ -12,6 +12,9 @@ on:
       build-intent:
         type: string
         required: true
+      build-target:
+        type: string
+        default: auto
       results-json:
         type: string
         required: true
@@ -36,6 +39,7 @@ jobs:
       SOURCE_REF: ${{ inputs.source-ref }}
       SOURCE_SHA: ${{ inputs.source-sha }}
       BUILD_INTENT: ${{ inputs.build-intent }}
+      BUILD_TARGET: ${{ inputs.build-target }}
       RESULTS_JSON: ${{ inputs.results-json }}
       BUILD_NOTIFY_PROVIDER: ${{ vars.BUILD_NOTIFY_PROVIDER }}
       BUILD_NOTIFY_WEBHOOK: ${{ secrets.BUILD_NOTIFY_WEBHOOK }}
@@ -63,7 +67,7 @@ jobs:
           name: yoyoboot-image-yoyoboot-docs-${{ env.SOURCE_SHA }}-${{ github.run_id }}
           path: ${{ runner.temp }}/yoyoboot-notification-primary/docs
       - name: Download submission validation evidence
-        if: ${{ inputs.build-intent == 'ci' }}
+        if: ${{ inputs.build-intent == 'ci' && inputs.build-target != 'docs' }}
         uses: actions/download-artifact@v5
         with:
           pattern: yoyoboot-quality*-${{ env.SOURCE_SHA }}-${{ github.run_id }}
@@ -83,7 +87,8 @@ jobs:
             }
             return [string] ($result['result'] ?? 'skipped')
           }
-          $scopeJob = if ($env:BUILD_INTENT -eq 'ci') { 'quality-plan' } else { 'image-scope' }
+          $docsOnly = $env:BUILD_INTENT -eq 'ci' -and $env:BUILD_TARGET -eq 'docs'
+          $scopeJob = if ($docsOnly) { 'validate-request' } elseif ($env:BUILD_INTENT -eq 'ci') { 'quality-plan' } else { 'image-scope' }
           $scope = $results[$scopeJob].outputs ?? @{}
           $qualityResult = Get-DeliveryResult 'quality-gate'
           $scopeFile = "$env:RUNNER_TEMP/yoyoboot-notification-quality/quality-scope.json"
@@ -109,7 +114,7 @@ jobs:
             -DocsResult (Get-DeliveryResult 'docs-delivery' 'build-result') `
             -DocsValidationResult (Get-DeliveryResult 'docs-delivery' 'validation-result') `
             -DocsMirrorResult (Get-DeliveryResult 'docs-delivery' 'mirror-result') `
-            -DocsSelected:($scope.has_docs -eq 'true') `
+            -DocsSelected:($docsOnly -or $scope.has_docs -eq 'true') `
             -PrimaryManifestsDirectory "$env:RUNNER_TEMP/yoyoboot-notification-primary" `
             -ComponentResultsJson ([string] ($admin['component-results-json'] ?? '{}')) `
             -MirrorResult (Get-DeliveryResult 'admin-delivery' 'mirror-result') `
