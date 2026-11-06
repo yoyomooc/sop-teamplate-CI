@@ -107,6 +107,7 @@ jobs:
             -SourceSha "$env:SOURCE_SHA" `
             -BuildIntent "$env:BUILD_INTENT" `
             -QualityResult $qualityResult `
+            -QualityScopePath $scopeFile `
             -QualityEvidencePath "$env:RUNNER_TEMP/yoyoboot-notification-quality/quality-gate.json" `
             -ImageResult (Get-DeliveryResult 'admin-delivery' 'result') `
             -ImageComponentsJson ([string] ($scope.components_json ?? '[]')) `
